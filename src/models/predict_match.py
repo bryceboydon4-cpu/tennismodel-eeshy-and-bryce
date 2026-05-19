@@ -7,12 +7,41 @@ import pandas as pd
 MODEL_PATH = "outputs/xgb_model.pkl"
 FEATURE_COLUMNS_PATH = "outputs/xgb_feature_columns.pkl"
 RATINGS_PATH = "outputs/current_elo_rankings.csv"
+PLAYER_FORM_PATH = "outputs/current_player_form.csv"
 SURFACE_NAMES = {
     "hard": "Hard",
     "clay": "Clay",
     "grass": "Grass",
     "carpet": "Carpet",
 }
+ROLLING_STAT_NAMES = (
+    "last_5_win_rate",
+    "last_10_win_rate",
+    "surface_last_10_win_rate",
+    "days_since_last_match",
+    "matches_last_14_days",
+    "ace_rate",
+    "double_fault_rate",
+    "first_serve_points_won",
+    "second_serve_points_won",
+    "return_points_won",
+    "break_points_saved",
+    "break_points_converted",
+    "last_10_ace_rate",
+    "last_10_double_fault_rate",
+    "last_10_first_serve_points_won",
+    "last_10_second_serve_points_won",
+    "last_10_return_points_won",
+    "last_10_break_points_saved",
+    "last_10_break_points_converted",
+    "surface_last_10_ace_rate",
+    "surface_last_10_double_fault_rate",
+    "surface_last_10_first_serve_points_won",
+    "surface_last_10_second_serve_points_won",
+    "surface_last_10_return_points_won",
+    "surface_last_10_break_points_saved",
+    "surface_last_10_break_points_converted",
+)
 
 model = joblib.load(MODEL_PATH)
 feature_columns = joblib.load(FEATURE_COLUMNS_PATH)
@@ -21,6 +50,13 @@ feature_columns = joblib.load(FEATURE_COLUMNS_PATH)
 def load_ratings():
     ratings = pd.read_csv(RATINGS_PATH)
     return ratings.set_index("player")
+
+
+def load_player_form():
+    try:
+        return pd.read_csv(PLAYER_FORM_PATH).set_index("player")
+    except FileNotFoundError:
+        return pd.DataFrame()
 
 
 def normalize_player_name(name):
@@ -85,6 +121,7 @@ def build_prediction_row(
     player_b_age=None,
     player_a_market_odds=None,
     player_b_market_odds=None,
+    extra_features=None,
 ):
     market_prob_a = 0
     market_prob_b = 0
@@ -116,6 +153,8 @@ def build_prediction_row(
         "best_of": best_of,
         "draw_size": draw_size,
     }
+    if extra_features is not None:
+        row.update(extra_features)
 
     row[f"surface_{surface}"] = 1
     if tourney_level is not None:
@@ -154,6 +193,7 @@ def predict_match_from_elos(
 
 def predict_match(player_a, player_b, surface, **context):
     ratings = load_ratings()
+    player_form = load_player_form()
     player_a = resolve_player_name(player_a, ratings)
     player_b = resolve_player_name(player_b, ratings)
     surface = normalize_surface(surface)
@@ -161,6 +201,17 @@ def predict_match(player_a, player_b, surface, **context):
 
     if surface_elo_col not in ratings.columns:
         raise ValueError(f"Unknown surface: {surface}")
+
+    extra_features = {}
+    if not player_form.empty and player_a in player_form.index and player_b in player_form.index:
+        surface_prefix = surface.lower()
+        for stat_name in ROLLING_STAT_NAMES:
+            col = f"{surface_prefix}_{stat_name}"
+            if col in player_form.columns:
+                extra_features[f"{stat_name}_diff"] = (
+                    player_form.loc[player_a, col] - player_form.loc[player_b, col]
+                )
+    context["extra_features"] = extra_features
 
     result = predict_match_from_elos(
         ratings.loc[player_a, "overall_elo"],
@@ -183,16 +234,45 @@ def predict_match(player_a, player_b, surface, **context):
         if result["player_b_win_prob"] > 0
         else None
     )
+    player_a_odds = context.get("player_a_market_odds")
+    player_b_odds = context.get("player_b_market_odds")
+    if (
+        player_a_odds is not None
+        and player_b_odds is not None
+        and player_a_odds > 1
+        and player_b_odds > 1
+    ):
+        raw_a = 1 / player_a_odds
+        raw_b = 1 / player_b_odds
+        market_prob_a = raw_a / (raw_a + raw_b)
+        market_prob_b = raw_b / (raw_a + raw_b)
+        result["player_a_market_prob"] = market_prob_a
+        result["player_b_market_prob"] = market_prob_b
+        result["player_a_edge"] = result["player_a_win_prob"] - market_prob_a
+        result["player_b_edge"] = result["player_b_win_prob"] - market_prob_b
+        result["player_a_expected_value"] = (
+            result["player_a_win_prob"] * player_a_odds - 1
+        )
+        result["player_b_expected_value"] = (
+            result["player_b_win_prob"] * player_b_odds - 1
+        )
     return result
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Predict a tennis matchup from current Elo/XGBoost outputs.",
+        description=(
+            "Predict a tennis matchup. Required: player_a player_b --surface "
+            "{hard, clay, grass, carpet}."
+        ),
     )
-    parser.add_argument("player_a")
-    parser.add_argument("player_b")
-    parser.add_argument("--surface", required=True)
+    parser.add_argument("player_a", help='First player name, e.g. "Carlos Alcaraz".')
+    parser.add_argument("player_b", help='Second player name, e.g. "Jannik Sinner".')
+    parser.add_argument(
+        "--surface",
+        required=True,
+        help="Surface type: hard, clay, grass, or carpet.",
+    )
     parser.add_argument("--tourney-level", default=None)
     parser.add_argument("--round", dest="round_name", default=None)
     parser.add_argument("--best-of", type=int, default=3)
@@ -203,9 +283,32 @@ def parse_args():
     parser.add_argument("--player-b-rank-points", type=float, default=None)
     parser.add_argument("--player-a-age", type=float, default=None)
     parser.add_argument("--player-b-age", type=float, default=None)
-    parser.add_argument("--player-a-market-odds", type=float, default=None)
-    parser.add_argument("--player-b-market-odds", type=float, default=None)
-    return parser.parse_args()
+    parser.add_argument(
+        "--odds",
+        nargs=2,
+        type=float,
+        metavar=("PLAYER_A_ODDS", "PLAYER_B_ODDS"),
+        help="Shortcut for market odds, e.g. --odds 1.67 2.44.",
+    )
+    parser.add_argument(
+        "--player-a-market-odds",
+        "--player-a-odds",
+        "--a-odds",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--player-b-market-odds",
+        "--player-b-odds",
+        "--b-odds",
+        type=float,
+        default=None,
+    )
+    args = parser.parse_args()
+    if args.odds is not None:
+        args.player_a_market_odds = args.odds[0]
+        args.player_b_market_odds = args.odds[1]
+    return args
 
 
 def main():
@@ -232,6 +335,13 @@ def main():
     print(f"{result['player_b']} win probability: {result['player_b_win_prob']:.3%}")
     print(f"{result['player_a']} fair decimal odds: {result['player_a_fair_decimal_odds']:.2f}")
     print(f"{result['player_b']} fair decimal odds: {result['player_b_fair_decimal_odds']:.2f}")
+    if "player_a_edge" in result:
+        print(f"{result['player_a']} market probability: {result['player_a_market_prob']:.3%}")
+        print(f"{result['player_b']} market probability: {result['player_b_market_prob']:.3%}")
+        print(f"{result['player_a']} edge: {result['player_a_edge']:+.3%}")
+        print(f"{result['player_b']} edge: {result['player_b_edge']:+.3%}")
+        print(f"{result['player_a']} expected value: {result['player_a_expected_value']:+.3%}")
+        print(f"{result['player_b']} expected value: {result['player_b_expected_value']:+.3%}")
 
 
 if __name__ == "__main__":

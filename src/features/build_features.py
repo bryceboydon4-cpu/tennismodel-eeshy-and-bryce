@@ -4,6 +4,45 @@ from pathlib import Path
 ELO_FEATURES_PATH = "data/processed/elo_features.csv"
 MATCH_FEATURES_PATH = "data/processed/match_features.csv"
 ODDS_DATA_GLOB = "data/odds/*.csv"
+ROLLING_STAT_NAMES = (
+    "last_5_win_rate",
+    "last_10_win_rate",
+    "surface_last_10_win_rate",
+    "days_since_last_match",
+    "matches_last_14_days",
+    "ace_rate",
+    "double_fault_rate",
+    "first_serve_points_won",
+    "second_serve_points_won",
+    "return_points_won",
+    "break_points_saved",
+    "break_points_converted",
+    "last_10_ace_rate",
+    "last_10_double_fault_rate",
+    "last_10_first_serve_points_won",
+    "last_10_second_serve_points_won",
+    "last_10_return_points_won",
+    "last_10_break_points_saved",
+    "last_10_break_points_converted",
+    "surface_last_10_ace_rate",
+    "surface_last_10_double_fault_rate",
+    "surface_last_10_first_serve_points_won",
+    "surface_last_10_second_serve_points_won",
+    "surface_last_10_return_points_won",
+    "surface_last_10_break_points_saved",
+    "surface_last_10_break_points_converted",
+    "matches_last_3_days",
+    "minutes_last_7_days",
+    "sets_last_7_days",
+    "retired_last_match",
+    "retirements_last_90_days",
+    "walkovers_last_90_days",
+)
+H2H_RATE_FEATURES = (
+    "h2h_win_rate",
+    "surface_h2h_win_rate",
+    "last_h2h_win",
+)
 
 
 def odds_probability(win_odds, lose_odds):
@@ -39,6 +78,8 @@ def load_odds_features():
             axis=1,
         )
         odds["market_prob_loser"] = 1 - odds["market_prob_winner"]
+        odds["market_odds_winner"] = odds.get("AvgW")
+        odds["market_odds_loser"] = odds.get("AvgL")
         odds["max_market_prob_winner"] = odds.apply(
             lambda row: odds_probability(row.get("MaxW"), row.get("MaxL")),
             axis=1,
@@ -65,6 +106,8 @@ def load_odds_features():
         "loser_rank_points",
         "market_prob_winner",
         "market_prob_loser",
+        "market_odds_winner",
+        "market_odds_loser",
         "max_market_prob_winner",
         "pinnacle_prob_winner",
         "bet365_prob_winner",
@@ -95,6 +138,24 @@ def safe_diff(row, left_col, right_col):
     return left - right
 
 
+def same_value(row, left_col, right_col):
+    left = row.get(left_col)
+    right = row.get(right_col)
+
+    if pd.isna(left) or pd.isna(right):
+        return 0
+
+    return int(left == right)
+
+
+def flag_value(row, col, value):
+    item = row.get(col)
+    if pd.isna(item):
+        return 0
+
+    return int(str(item).casefold() == value.casefold())
+
+
 def player_view(row, player_is_winner):
     if player_is_winner:
         prefix_a = "winner"
@@ -107,7 +168,8 @@ def player_view(row, player_is_winner):
         target = 0
         sign = -1
 
-    return {
+    view = {
+        "match_id": row["match_id"],
         "date": row["date"],
         "surface": row["surface"],
         "tourney_level": row["tourney_level"],
@@ -125,6 +187,20 @@ def player_view(row, player_is_winner):
             f"{prefix_b}_rank_points",
         ),
         "age_diff": safe_diff(row, f"{prefix_a}_age", f"{prefix_b}_age"),
+        "height_diff": safe_diff(row, f"{prefix_a}_ht", f"{prefix_b}_ht"),
+        "seed_diff": safe_diff(row, f"{prefix_a}_seed", f"{prefix_b}_seed"),
+        "same_country": same_value(row, f"{prefix_a}_ioc", f"{prefix_b}_ioc"),
+        "same_hand": same_value(row, f"{prefix_a}_hand", f"{prefix_b}_hand"),
+        "player_a_lefty": flag_value(row, f"{prefix_a}_hand", "L"),
+        "player_b_lefty": flag_value(row, f"{prefix_b}_hand", "L"),
+        "player_a_qualifier": flag_value(row, f"{prefix_a}_entry", "Q"),
+        "player_b_qualifier": flag_value(row, f"{prefix_b}_entry", "Q"),
+        "player_a_wildcard": flag_value(row, f"{prefix_a}_entry", "WC"),
+        "player_b_wildcard": flag_value(row, f"{prefix_b}_entry", "WC"),
+        "player_a_lucky_loser": flag_value(row, f"{prefix_a}_entry", "LL"),
+        "player_b_lucky_loser": flag_value(row, f"{prefix_b}_entry", "LL"),
+        "h2h_meetings": row.get("winner_h2h_meetings", 0),
+        "surface_h2h_meetings": row.get("winner_surface_h2h_meetings", 0),
         "market_prob_diff": sign * safe_diff(
             row,
             "market_prob_winner",
@@ -132,6 +208,10 @@ def player_view(row, player_is_winner):
         ),
         "market_prob_a": row.get(
             "market_prob_winner" if player_is_winner else "market_prob_loser",
+            0,
+        ),
+        "market_odds_a": row.get(
+            "market_odds_winner" if player_is_winner else "market_odds_loser",
             0,
         ),
         "max_market_prob_a": (
@@ -152,6 +232,19 @@ def player_view(row, player_is_winner):
         "has_market_odds": int(not pd.isna(row.get("market_prob_winner"))),
         "target": target,
     }
+    for stat_name in ROLLING_STAT_NAMES:
+        view[f"{stat_name}_diff"] = safe_diff(
+            row,
+            f"{prefix_a}_{stat_name}",
+            f"{prefix_b}_{stat_name}",
+        )
+    for stat_name in H2H_RATE_FEATURES:
+        view[f"{stat_name}_diff"] = safe_diff(
+            row,
+            f"{prefix_a}_{stat_name}",
+            f"{prefix_b}_{stat_name}",
+        )
+    return view
 
 
 def build_features():
